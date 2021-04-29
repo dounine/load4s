@@ -253,7 +253,7 @@ object UDPClientManager extends JsonParse {
               logger.info(e.logJson)
               val time = System.currentTimeMillis() / 1000 / data.online
               val dateTime = Instant
-                .ofEpochMilli(time * 1000 * data.online)
+                .ofEpochMilli(time * 1000 * data.online - (data.online * 1000))
                 .atZone(ZoneId.systemDefault())
                 .toLocalDateTime
               val redis = jedisPool.getResource
@@ -391,7 +391,7 @@ object UDPClientManager extends JsonParse {
               logger.info(e.logJson)
               val time = System.currentTimeMillis() / 1000 / data.online
               val dateTime = Instant
-                .ofEpochMilli(time * 1000 * data.online)
+                .ofEpochMilli(time * 1000 * data.online -(data.online * 1000))
                 .atZone(ZoneId.systemDefault())
                 .toLocalDateTime
               val redis = jedisPool.getResource
