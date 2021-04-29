@@ -54,6 +54,7 @@ object UDPServer extends JsonParse {
 
     val pre = config.getInt("client.duration")
     val expire = config.getInt("client.expire")
+    val cpu = config.getInt("client.cpu")
     Source.maybe
       .via(bindFlow)
       .map(_.getData().utf8String)
@@ -62,6 +63,12 @@ object UDPServer extends JsonParse {
         config.getDuration("client.time").toMillis.milliseconds
       )
       .to(Sink.foreach(list => {
+        list.foreach(f = i => {
+          var index: Int = 0
+          while (index < cpu) {
+            index += 1
+          }
+        })
         val time = System.currentTimeMillis() / 1000 / pre
         val dateTime = Instant
           .ofEpochMilli(time * 1000 * pre)
