@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: load4s
+  name: load4s
+  namespace: jb
+  annotations:
+    kubernetes.io/change-cause: "init"
+spec:
+  revisionHistoryLimit: 10
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app: load4s
+  template:
+    metadata:
+      labels:
+        app: load4s
+        actorSystemName: load4s
+      annotations:
+        k8s.aliyun.com/eci-use-specs: "ecs.ic5.large"
+        k8s.aliyun.com/eci-spot-strategy: "SpotAsPriceGo"
+        k8s.aliyun.com/eci-with-eip: "true"
+    spec:
+      volumes:
+        - name: workdir
+          emptyDir: {}
+      containers:
+        - name: load4s
+          image: dounine/load4s:latest
+          livenessProbe:
+            httpGet:
+              path: /alive
+              port: management
+            periodSeconds: 10
+            failureThreshold: 5
+            initialDelaySeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: management
+            periodSeconds: 10
+            failureThreshold: 3
+            initialDelaySeconds: 10
+          ports:
+            - name: http
+              containerPort: 30000
+              protocol: TCP
+            - name: remote
+              containerPort: 25520
+              protocol: TCP
+            - name: management
+              containerPort: 8558
+              protocol: TCP
+          volumeMounts:
+            - name: workdir
+              mountPath: "/root"
+          env:
+            - name: REQUIRED_CONTACT_POINT_NR
+              value: "3"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: load4s
+  namespace: jb
+spec:
+  selector:
+    app: load4s
+  ports:
+    - name: http
+      port: 30000
+      protocol: TCP
+      targetPort: http
+  type: ClusterIP
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: load4s-ingress
+  namespace: jb
+spec:
+  rules:
+    - host: load4s.61week.com
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: load4s
+              servicePort: 30000
