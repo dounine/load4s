@@ -67,6 +67,7 @@ object UDPServer extends JsonParse {
 
     val withinElements = config.getInt("client.elements")
     val withinTime = config.getDuration("client.time").toMillis.milliseconds
+    val debug = config.getBoolean("client.debug")
 
     logger.info(s"""
         |-------  bind host: ${host}   -------
@@ -95,6 +96,9 @@ object UDPServer extends JsonParse {
             index += 1
           }
         })
+        if (debug) {
+          logger.info(list.toString())
+        }
         val time = System.currentTimeMillis() / 1000 / pre
         val dateTime = Instant
           .ofEpochMilli(time * 1000 * pre)
