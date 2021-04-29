@@ -759,7 +759,7 @@ object UDPClientManager extends JsonParse {
                 val source = Source(data.standbys)
                   .throttle(
                     data.standbys.size,
-                    data.infos.pressingInfo.betweenTime
+                    data.infos.pressingInfo.loadTime
                   )
                   .viaMat(KillSwitches.single)(Keep.right)
                   .preMaterialize()
@@ -775,7 +775,7 @@ object UDPClientManager extends JsonParse {
                         hostName = data.infos.pressingInfo.host,
                         port = data.infos.pressingInfo.port,
                         elements = data.infos.pressingInfo.sendElements,
-                        pre = data.infos.pressingInfo.loadTime,
+                        pre = data.infos.pressingInfo.betweenTime,
                         datastream = data.infos.pressingInfo.dataLength
                       )(context.self)
                     )
