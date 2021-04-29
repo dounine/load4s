@@ -135,7 +135,10 @@ object UDPClientManager extends JsonParse {
       releaseInfo: ReleaseInfo
   ) extends BaseSerializer
 
-  final case class OnlineCount() extends BaseSerializer
+  final case class OnlineCount(
+      time: LocalDateTime,
+      client: Int
+  ) extends BaseSerializer
 
   final case class OnlineUpdate(
       online: Option[Int],
@@ -200,6 +203,14 @@ object UDPClientManager extends JsonParse {
           )
         } else new JedisPool(c, redisHost, redisPort, 0)
 
+        def currentTime(data: DataStore): LocalDateTime = {
+          val time = System.currentTimeMillis() / 1000 / data.online
+          Instant
+            .ofEpochMilli(time * 1000 * data.online)
+            .atZone(ZoneId.systemDefault())
+            .toLocalDateTime
+        }
+
         def release(
             data: DataStore
         ): Behavior[BaseSerializer] =
@@ -212,9 +223,9 @@ object UDPClientManager extends JsonParse {
                   onlineLimit = onlineLimit
                 )
               )
-              timers.startTimerAtFixedRate(
+              timers.startSingleTimer(
                 "online",
-                OnlineCount(),
+                OnlineCount(currentTime(data), data.workings.size),
                 data.online.seconds
               )
               release(
@@ -249,21 +260,21 @@ object UDPClientManager extends JsonParse {
                 )
               )
             }
-            case e @ OnlineCount() => {
+            case e @ OnlineCount(time, client) => {
               logger.info(e.logJson)
-              val time = System.currentTimeMillis() / 1000 / data.online
-              val dateTime = Instant
-                .ofEpochMilli(time * 1000 * data.online - (data.online * 1000))
-                .atZone(ZoneId.systemDefault())
-                .toLocalDateTime
+              timers.startSingleTimer(
+                "online",
+                OnlineCount(currentTime(data), data.workings.size),
+                data.online.seconds
+              )
               val redis = jedisPool.getResource
-              val server = redis.scard(dateTime.toString).toInt
+              val server = redis.scard(time.toString).toInt
               subInfoQueue.offer(
                 SubInfo(
                   statistic = Option(
                     Statistic(
-                      time = dateTime,
-                      client = data.workings.size,
+                      time = time,
+                      client = client,
                       server = server
                     )
                   )
@@ -296,8 +307,8 @@ object UDPClientManager extends JsonParse {
               release(
                 data.copy(
                   statistics = limitStatistics ++ Map(
-                    dateTime -> StatisticInfo(
-                      client = data.workings.size,
+                    time -> StatisticInfo(
+                      client = client,
                       server = server
                     )
                   )
@@ -375,9 +386,9 @@ object UDPClientManager extends JsonParse {
                   onlineLimit = onlineLimit
                 )
               )
-              timers.startTimerAtFixedRate(
+              timers.startSingleTimer(
                 "online",
-                OnlineCount(),
+                OnlineCount(currentTime(data), data.workings.size),
                 data.online.seconds
               )
               pressing(
@@ -387,21 +398,21 @@ object UDPClientManager extends JsonParse {
                 )
               )
             }
-            case e @ OnlineCount() => {
+            case e @ OnlineCount(time, client) => {
               logger.info(e.logJson)
-              val time = System.currentTimeMillis() / 1000 / data.online
-              val dateTime = Instant
-                .ofEpochMilli(time * 1000 * data.online -(data.online * 1000))
-                .atZone(ZoneId.systemDefault())
-                .toLocalDateTime
+              timers.startSingleTimer(
+                "online",
+                OnlineCount(currentTime(data), data.workings.size),
+                data.online.seconds
+              )
               val redis = jedisPool.getResource
-              val server = redis.scard(dateTime.toString).toInt
+              val server = redis.scard(time.toString).toInt
               subInfoQueue.offer(
                 SubInfo(
                   statistic = Option(
                     Statistic(
-                      time = dateTime,
-                      client = data.workings.size,
+                      time = time,
+                      client = client,
                       server = server
                     )
                   )
@@ -434,8 +445,8 @@ object UDPClientManager extends JsonParse {
               pressing(
                 data.copy(
                   statistics = limitStatistics ++ Map(
-                    dateTime -> StatisticInfo(
-                      client = data.workings.size,
+                    time -> StatisticInfo(
+                      client = client,
                       server = server
                     )
                   )
@@ -488,8 +499,8 @@ object UDPClientManager extends JsonParse {
             }
             case e @ PressingRun(run) => {
               logger.info(e.logJson)
+              timers.cancel("online")
               if (!run) {
-                timers.cancel("online")
                 data.kills.pressing.foreach(_.shutdown())
                 Source(data.workings)
                   .runForeach(id => {
@@ -540,9 +551,9 @@ object UDPClientManager extends JsonParse {
                   )
                 )
 
-                timers.startTimerAtFixedRate(
+                timers.startSingleTimer(
                   "online",
-                  OnlineCount(),
+                  OnlineCount(currentTime(data), data.workings.size),
                   data.online.seconds
                 )
 
@@ -626,7 +637,12 @@ object UDPClientManager extends JsonParse {
               )
             }
 
-            case OnlineCount() => {
+            case OnlineCount(time, client) => {
+              timers.startSingleTimer(
+                "online",
+                OnlineCount(currentTime(data), data.workings.size),
+                data.online.seconds
+              )
               Behaviors.same
             }
             case e @ Sub() => {
@@ -663,6 +679,7 @@ object UDPClientManager extends JsonParse {
             }
             case e @ InitRun(run) => {
               logger.info(e.logJson)
+              timers.cancel("online")
               if (!run) {
                 timers.cancel("online")
                 Source(data.standbys)
@@ -768,9 +785,9 @@ object UDPClientManager extends JsonParse {
                     status = Option("pressing")
                   )
                 )
-                timers.startTimerAtFixedRate(
+                timers.startSingleTimer(
                   "online",
-                  OnlineCount(),
+                  OnlineCount(currentTime(data), data.workings.size),
                   data.online.seconds
                 )
                 pressing(
