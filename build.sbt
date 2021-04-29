@@ -13,6 +13,7 @@ lazy val app = (project in file("."))
     scalaVersion := "2.13.4",
     dockerBaseImage := "openjdk:11.0.8-slim",
     dockerExposedPorts := Seq(30000),
+    dockerUsername := Option("dounine"),
     dockerEnvVars := Map("apiVersion" -> "1.0.0"),
     dockerEntrypoint := Seq("/opt/docker/bin/load4s"),
     parallelExecution in Test := false,
