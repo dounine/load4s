@@ -293,7 +293,7 @@ object UDPClientManager extends JsonParse {
                     })
                     .toList
                     .sortBy(_.time)
-                    .takeRight(data.statistics.size - 1)
+                    .takeRight(data.onlineLimit)
                     .map(i => {
                       (
                         i.time,
@@ -431,7 +431,7 @@ object UDPClientManager extends JsonParse {
                     })
                     .toList
                     .sortBy(_.time)
-                    .takeRight(data.statistics.size - 1)
+                    .takeRight(data.onlineLimit)
                     .map(i => {
                       (
                         i.time,
