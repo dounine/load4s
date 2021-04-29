@@ -9,7 +9,7 @@ metadata:
     kubernetes.io/change-cause: "init"
 spec:
   revisionHistoryLimit: 10
-  replicas: 1
+  replicas: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -24,7 +24,7 @@ spec:
         app: load4s
         actorSystemName: load4s
       annotations:
-        k8s.aliyun.com/eci-use-specs: "ecs.ic5.large"
+        k8s.aliyun.com/eci-use-specs: "ecs.c5.2xlarge"
         k8s.aliyun.com/eci-spot-strategy: "SpotAsPriceGo"
         k8s.aliyun.com/eci-with-eip: "true"
     spec:
@@ -33,7 +33,7 @@ spec:
           emptyDir: {}
       containers:
         - name: load4s
-          image: dounine/load4s:latest
+          image: registry.cn-hangzhou.aliyuncs.com/xinghan-docker/load4s:0.1.0-SNAPSHOT
           livenessProbe:
             httpGet:
               path: /alive
@@ -64,6 +64,12 @@ spec:
           env:
             - name: REQUIRED_CONTACT_POINT_NR
               value: "3"
+            - name: REDIS_HOST
+              value: "xxxx.redis.rds.aliyuncs.com"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              value: "xxxxxxx"
 ---
 apiVersion: v1
 kind: Service
@@ -76,21 +82,5 @@ spec:
   ports:
     - name: http
       port: 30000
-      protocol: TCP
-      targetPort: http
-  type: ClusterIP
----
-apiVersion: extensions/v1beta1
-kind: Ingress
-metadata:
-  name: load4s-ingress
-  namespace: jb
-spec:
-  rules:
-    - host: load4s.61week.com
-      http:
-        paths:
-          - path: /
-            backend:
-              serviceName: load4s
-              servicePort: 30000
+      nodePort: 30000
+  type: LoadBalancer

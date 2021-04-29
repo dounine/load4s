@@ -8,6 +8,7 @@ import akka.stream.alpakka.udp.Datagram
 import akka.stream.alpakka.udp.scaladsl.Udp
 import akka.stream.scaladsl.{Flow, Sink, Source}
 import com.dounine.load4s.tools.json.JsonParse
+import org.slf4j.LoggerFactory
 import redis.clients.jedis.{JedisPool, JedisPoolConfig, Protocol}
 
 import scala.concurrent.duration._
@@ -17,6 +18,8 @@ import scala.concurrent.Future
 
 object UDPServer extends JsonParse {
 
+  private val logger = LoggerFactory.getLogger(UDPServer.getClass)
+
   def main(args: Array[String]): Unit = {
     implicit val system = ActorSystem(Behaviors.empty, "load4s")
     val config = system.settings.config.getConfig("app")
@@ -25,7 +28,13 @@ object UDPServer extends JsonParse {
     implicit val executionContext = system.executionContext
     val sharding = ClusterSharding(system)
 
-    val bindToLocal = new InetSocketAddress("127.0.0.1", 8080)
+    val host = config.getString("client.host")
+    val port = config.getInt("client.port")
+
+    val bindToLocal = new InetSocketAddress(
+      host,
+      port
+    )
     val bindFlow: Flow[Datagram, Datagram, Future[InetSocketAddress]] =
       Udp.bindFlow(bindToLocal)
 
@@ -55,12 +64,29 @@ object UDPServer extends JsonParse {
     val pre = config.getInt("client.duration")
     val expire = config.getInt("client.expire")
     val cpu = config.getInt("client.cpu")
+
+    val withinElements = config.getInt("client.elements")
+    val withinTime = config.getDuration("client.time").toMillis.milliseconds
+
+    logger.info(s"""
+        |-------  bind host: ${host}   -------
+        |-------  bind port: ${port}   -------
+        |-------  redis host: ${redisHost}  -------
+        |-------  redis port: ${redisPort}   -------
+        |-------  redis password: ${redisPassword}   -------
+        |-------  pre time save to redis: ${pre}s   -------
+        |-------  redis key expire time: ${expire}s   -------
+        |-------  cpu while computer: ${cpu}  -------
+        |-------  groupedWithin elements: ${withinElements}  -------
+        |-------  groupedWithinTime: ${withinTime}  -------
+        |""".stripMargin)
+
     Source.maybe
       .via(bindFlow)
       .map(_.getData().utf8String)
       .groupedWithin(
-        config.getInt("client.elements"),
-        config.getDuration("client.time").toMillis.milliseconds
+        withinElements,
+        withinTime
       )
       .to(Sink.foreach(list => {
         list.foreach(f = i => {
