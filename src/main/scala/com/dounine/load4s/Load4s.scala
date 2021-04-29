@@ -24,7 +24,7 @@ object Load4s {
 
   def main(args: Array[String]): Unit = {
 
-    implicit val system = ActorSystem(Behaviors.empty, "trader4s")
+    implicit val system = ActorSystem(Behaviors.empty, "load4s")
     val config = system.settings.config.getConfig("app")
     val appName = config.getString("name")
     implicit val materialize = SystemMaterializer(system).materializer

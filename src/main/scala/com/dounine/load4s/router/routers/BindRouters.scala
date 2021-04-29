@@ -72,7 +72,8 @@ object BindRouters extends SuportRouter {
         concat(
           new HealthRouter(system).route,
           new CachingRouter(system).route,
-          new SSERouter(system).route
+          new SSERouter(system).route,
+          new WebsocketRouter(system).route
         )
       )
     )

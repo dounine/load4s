@@ -8,17 +8,25 @@ import akka.cluster.sharding.typed.scaladsl.{
   EntityTypeKey
 }
 import akka.persistence.typed.PersistenceId
-import akka.stream.{KillSwitches, SystemMaterializer, UniqueKillSwitch}
+import akka.stream.{
+  KillSwitches,
+  OverflowStrategy,
+  SourceRef,
+  SystemMaterializer,
+  UniqueKillSwitch
+}
 import akka.stream.alpakka.udp.Datagram
 import akka.stream.alpakka.udp.scaladsl.Udp
-import akka.stream.scaladsl.{Keep, Source}
+import akka.stream.scaladsl.{BroadcastHub, Keep, Source, StreamRefs}
 import akka.util.ByteString
+import com.dounine.load4s.behaviors.client.UDPClientManager.Statistic
 import com.dounine.load4s.model.models.BaseSerializer
 import com.dounine.load4s.tools.json.JsonParse
 import org.slf4j.LoggerFactory
+import redis.clients.jedis.{JedisPool, JedisPoolConfig, Protocol}
 
 import java.net.InetSocketAddress
-import java.time.LocalDateTime
+import java.time.{Instant, LocalDateTime, ZoneId}
 import java.time.temporal.ChronoUnit
 import scala.concurrent.duration.FiniteDuration
 import scala.concurrent.duration._
@@ -32,247 +40,946 @@ object UDPClientManager extends JsonParse {
 
   trait Event extends BaseSerializer
 
-  final case class CreateClient(
-      size: Int,
+  final case class InitUpdate(
+      clients: Int,
+      loadTime: FiniteDuration
+  ) extends BaseSerializer
+
+  final case class InitRun(run: Boolean) extends BaseSerializer
+
+  final case class PressingUpdate(
+      host: String,
+      port: Int,
+      betweenTime: FiniteDuration = 1.seconds,
+      sendElements: Int = 1,
+      loadTime: FiniteDuration = 1.seconds,
+      dataLength: Int = 0
+  ) extends BaseSerializer
+
+  final case class PressingRun(run: Boolean) extends BaseSerializer
+
+  final case class ReleaseUpdate(
+      clients: Int,
       time: FiniteDuration
   ) extends BaseSerializer
 
-  final case class LoadTest(
-      hostName: String,
-      port: Int,
-      between: FiniteDuration = 1.seconds,
-      elements: Int = 1,
-      pre: FiniteDuration = 1.seconds,
-      datastream: Int = 0
-  ) extends BaseSerializer
-
-  final case class Strategy(
-      element: Int,
-      pre: FiniteDuration
-  ) extends BaseSerializer
-
-  final case class StrategyRun() extends BaseSerializer
-
-  final case class StrategyStop() extends BaseSerializer
-
-  final case class Stop() extends BaseSerializer
+  final case class ReleaseRun(run: Boolean) extends BaseSerializer
 
   final case class Query()(val replyTo: ActorRef[BaseSerializer])
       extends BaseSerializer
 
+  final case class Sub()(val replyTo: ActorRef[BaseSerializer])
+      extends BaseSerializer
+
+  final case class SubOk(source: SourceRef[SubInfo]) extends BaseSerializer
+
+  final case class SubInfo(
+      standbys: Option[Int] = None,
+      workings: Option[Int] = None,
+      online: Option[Int] = None,
+      onlineLimit: Option[Int] = None,
+      initInfo: Option[InitInfo] = None,
+      pressingInfo: Option[PressingInfo] = None,
+      releaseInfo: Option[ReleaseInfo] = None,
+      status: Option[String] = None,
+      statistic: Option[Statistic] = None
+  ) extends BaseSerializer
+
+  final case class SubPush(
+      info: SubInfo
+  ) extends BaseSerializer
+
   final case class QueryOk(
-      initSize: Int = 0,
-      standbySize: Int = 0,
-      strategy: Strategy,
-      status: String
+      standbys: Int,
+      workings: Int,
+      infos: Infos,
+      status: String,
+      statistics: Seq[Statistic],
+      online: Int,
+      onlineLimit: Int
+  ) extends BaseSerializer
+
+  final case class StatisticInfo(
+      client: Int,
+      server: Int
+  ) extends BaseSerializer
+
+  final case class Statistic(
+      time: LocalDateTime,
+      client: Int,
+      server: Int
+  ) extends BaseSerializer
+
+  case class InitInfo(
+      clients: Int,
+      loadTime: FiniteDuration
+  ) extends BaseSerializer
+
+  case class PressingInfo(
+      host: String,
+      port: Int,
+      loadTime: FiniteDuration,
+      dataLength: Int,
+      betweenTime: FiniteDuration,
+      sendElements: Int
+  ) extends BaseSerializer
+
+  case class ReleaseInfo(
+      time: FiniteDuration,
+      clients: Int
+  ) extends BaseSerializer
+
+  final case class Infos(
+      initInfo: InitInfo,
+      pressingInfo: PressingInfo,
+      releaseInfo: ReleaseInfo
+  ) extends BaseSerializer
+
+  final case class OnlineCount() extends BaseSerializer
+
+  final case class OnlineUpdate(
+      online: Option[Int],
+      onlineLimit: Option[Int]
+  ) extends BaseSerializer
+
+  final case class KillInfos(
+      pressing: Option[UniqueKillSwitch],
+      release: Option[UniqueKillSwitch]
+  ) extends BaseSerializer
+
+  final case class DataStore(
+      standbys: Set[String],
+      workings: Set[String],
+      online: Int,
+      onlineLimit: Int,
+      kills: KillInfos,
+      statistics: Map[LocalDateTime, StatisticInfo],
+      infos: Infos
   ) extends BaseSerializer
 
   def apply(
       persistenceId: PersistenceId,
       shard: ActorRef[ClusterSharding.ShardCommand]
   ): Behavior[BaseSerializer] =
-    Behaviors.setup { context =>
-      Behaviors.withTimers(timers => {
+    Behaviors.withTimers(timers =>
+      Behaviors.setup { context =>
         implicit val materializer =
           SystemMaterializer(context.system).materializer
 
         val sharding = ClusterSharding(context.system)
+        val (subInfoQueue, subInfoSource) = Source
+          .queue[SubInfo](
+            2,
+            OverflowStrategy.dropHead
+          )
+          .preMaterialize()(materializer)
+        val subInfoBrocastHub =
+          subInfoSource.runWith(BroadcastHub.sink)(materializer)
 
-        def strategyRun(
-            initSize: Int,
-            standbys: Set[String],
-            strategy: Strategy,
-            loadKill: Option[UniqueKillSwitch],
-            strategyKill: Option[UniqueKillSwitch]
+        val config = context.system.settings.config.getConfig("app")
+        val c: JedisPoolConfig = new JedisPoolConfig
+        c.setMaxIdle(config.getInt("redis.maxIdle"))
+        c.setMaxTotal(config.getInt("redis.maxTotal"))
+        c.setTestOnReturn(true)
+        c.setTestWhileIdle(true)
+        c.setTestOnBorrow(true)
+        c.setMaxWaitMillis(
+          config.getLong("redis.maxWaitMillis")
+        )
+        val redisHost: String = config.getString("redis.host")
+        val redisPort: Int = config.getInt("redis.port")
+        val redisPassword: String = config.getString("redis.password")
+        val jedisPool = if (redisPassword != "") {
+          new JedisPool(
+            c,
+            redisHost,
+            redisPort,
+            0,
+            redisPassword,
+            Protocol.DEFAULT_DATABASE
+          )
+        } else new JedisPool(c, redisHost, redisPort, 0)
+
+        def release(
+            data: DataStore
         ): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ OnlineUpdate(online, onlineLimit) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(
+                SubInfo(
+                  online = online,
+                  onlineLimit = onlineLimit
+                )
+              )
+              timers.startTimerAtFixedRate(
+                "online",
+                OnlineCount(),
+                data.online.seconds
+              )
+              release(
+                data.copy(
+                  online = online.getOrElse(data.online),
+                  onlineLimit = onlineLimit.getOrElse(data.onlineLimit)
+                )
+              )
+            }
+            case e @ UDPClient.WaitOk(clientId, key) => {
+              logger.info(e.logJson)
+              if (key.getOrElse("") == "release") {
+                subInfoQueue.offer(
+                  SubInfo(
+                    workings = Option(data.workings.size - 1)
+                  )
+                )
+              } else {
+                timers.startSingleTimer(
+                  "waitOk",
+                  SubPush(
+                    info = SubInfo(
+                      workings = Option(data.workings.size - 1)
+                    )
+                  ),
+                  1.seconds
+                )
+              }
+              release(
+                data.copy(
+                  workings = data.workings.filterNot(_ == clientId)
+                )
+              )
+            }
+            case e @ OnlineCount() => {
+              logger.info(e.logJson)
+              val time = System.currentTimeMillis() / 1000 / data.online
+              val dateTime = Instant
+                .ofEpochMilli(time * 1000 * data.online)
+                .atZone(ZoneId.systemDefault())
+                .toLocalDateTime
+              val redis = jedisPool.getResource
+              val server = redis.scard(dateTime.toString).toInt
+              subInfoQueue.offer(
+                SubInfo(
+                  statistic = Option(
+                    Statistic(
+                      time = dateTime,
+                      client = data.workings.size,
+                      server = server
+                    )
+                  )
+                )
+              )
+              redis.close()
+              val limitStatistics =
+                if (data.statistics.size > data.onlineLimit) {
+                  data.statistics
+                    .map(i => {
+                      Statistic(
+                        time = i._1,
+                        client = i._2.client,
+                        server = i._2.server
+                      )
+                    })
+                    .toList
+                    .sortBy(_.time)
+                    .takeRight(data.statistics.size - 1)
+                    .map(i => {
+                      (
+                        i.time,
+                        StatisticInfo(client = i.client, server = i.server)
+                      )
+                    })
+                    .toMap
+                } else {
+                  data.statistics
+                }
+              release(
+                data.copy(
+                  statistics = limitStatistics ++ Map(
+                    dateTime -> StatisticInfo(
+                      client = data.workings.size,
+                      server = server
+                    )
+                  )
+                )
+              )
+            }
+            case e @ Sub() => {
+              logger.info(e.logJson)
+              val source = subInfoBrocastHub.runWith(StreamRefs.sourceRef())
+              e.replyTo.tell(SubOk(source))
+              Behaviors.same
+            }
             case e @ Query() => {
               logger.info(e.logJson)
               e.replyTo.tell(
                 QueryOk(
-                  initSize = initSize,
-                  standbySize = standbys.size,
-                  strategy = strategy,
-                  status = "strategyRun"
+                  standbys = data.standbys.size,
+                  workings = data.workings.size,
+                  infos = data.infos,
+                  status = "release",
+                  online = data.online,
+                  onlineLimit = data.onlineLimit,
+                  statistics = data.statistics
+                    .map(ii => {
+                      Statistic(
+                        time = ii._1,
+                        client = ii._2.client,
+                        server = ii._2.server
+                      )
+                    })
+                    .toList
+                    .sortBy(_.time)
                 )
               )
               Behaviors.same
             }
 
-            case e @ StrategyStop() => {
+            case e @ ReleaseRun(run) => {
               logger.info(e.logJson)
-              strategyKill.foreach(_.shutdown())
-              loadTest(
-                initSize = initSize,
-                standbys = Set.empty,
-                strategy = strategy,
-                loadKill = loadKill
-              )
+              if (!run) {
+                data.kills.release.foreach(_.shutdown())
+                subInfoQueue.offer(
+                  SubInfo(
+                    status = Option("pressing")
+                  )
+                )
+                pressing(
+                  data = data.copy(
+                    kills = data.kills.copy(
+                      release = Option.empty
+                    )
+                  )
+                )
+              } else {
+                throw new Exception("状态错误")
+              }
             }
+            case e @ SubPush(info) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(info)
+              Behaviors.same
+            }
+
           }
 
-        def loadTest(
-            initSize: Int,
-            standbys: Set[String],
-            strategy: Strategy,
-            loadKill: Option[UniqueKillSwitch]
+        def pressing(
+            data: DataStore
         ): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ OnlineUpdate(online, onlineLimit) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(
+                SubInfo(
+                  online = online,
+                  onlineLimit = onlineLimit
+                )
+              )
+              timers.startTimerAtFixedRate(
+                "online",
+                OnlineCount(),
+                data.online.seconds
+              )
+              pressing(
+                data.copy(
+                  online = online.getOrElse(data.online),
+                  onlineLimit = onlineLimit.getOrElse(data.onlineLimit)
+                )
+              )
+            }
+            case e @ OnlineCount() => {
+              logger.info(e.logJson)
+              val time = System.currentTimeMillis() / 1000 / data.online
+              val dateTime = Instant
+                .ofEpochMilli(time * 1000 * data.online)
+                .atZone(ZoneId.systemDefault())
+                .toLocalDateTime
+              val redis = jedisPool.getResource
+              val server = redis.scard(dateTime.toString).toInt
+              subInfoQueue.offer(
+                SubInfo(
+                  statistic = Option(
+                    Statistic(
+                      time = dateTime,
+                      client = data.workings.size,
+                      server = server
+                    )
+                  )
+                )
+              )
+              redis.close()
+              val limitStatistics =
+                if (data.statistics.size > data.onlineLimit) {
+                  data.statistics
+                    .map(i => {
+                      Statistic(
+                        time = i._1,
+                        client = i._2.client,
+                        server = i._2.server
+                      )
+                    })
+                    .toList
+                    .sortBy(_.time)
+                    .takeRight(data.statistics.size - 1)
+                    .map(i => {
+                      (
+                        i.time,
+                        StatisticInfo(client = i.client, server = i.server)
+                      )
+                    })
+                    .toMap
+                } else {
+                  data.statistics
+                }
+              pressing(
+                data.copy(
+                  statistics = limitStatistics ++ Map(
+                    dateTime -> StatisticInfo(
+                      client = data.workings.size,
+                      server = server
+                    )
+                  )
+                )
+              )
+            }
+            case e @ Sub() => {
+              logger.info(e.logJson)
+              val source = subInfoBrocastHub.runWith(StreamRefs.sourceRef())
+              e.replyTo.tell(SubOk(source))
+              Behaviors.same
+            }
+            case e @ Statistic(time, client, server) => {
+              logger.info(e.logJson)
+              pressing(
+                data.copy(
+                  statistics = data.statistics ++ Map(
+                    time ->
+                      StatisticInfo(
+                        client = client,
+                        server = server
+                      )
+                  )
+                )
+              )
+            }
             case e @ Query() => {
               logger.info(e.logJson)
               e.replyTo.tell(
                 QueryOk(
-                  initSize = initSize,
-                  standbySize = standbys.size,
-                  strategy = strategy,
-                  status = "loadTest"
+                  standbys = data.standbys.size,
+                  workings = data.workings.size,
+                  infos = data.infos,
+                  status = "pressing",
+                  online = data.online,
+                  onlineLimit = data.onlineLimit,
+                  statistics = data.statistics
+                    .map(ii => {
+                      Statistic(
+                        time = ii._1,
+                        client = ii._2.client,
+                        server = ii._2.server
+                      )
+                    })
+                    .toList
+                    .sortBy(_.time)
                 )
               )
               Behaviors.same
             }
-
-            case e @ StrategyRun() => {
+            case e @ PressingRun(run) => {
               logger.info(e.logJson)
-              val source =
-                Source(standbys)
-                  .throttle(strategy.element, strategy.pre)
-                  .viaMat(KillSwitches.single)(Keep.both)
-                  .preMaterialize()
-
-              source._2.runForeach(id => {
-                val client = sharding.entityRefFor(
-                  UDPClient.typeKey,
-                  id
+              if (!run) {
+                timers.cancel("online")
+                data.kills.pressing.foreach(_.shutdown())
+                Source(data.workings)
+                  .runForeach(id => {
+                    val client = sharding.entityRefFor(
+                      UDPClient.typeKey,
+                      id
+                    )
+                    client.tell(UDPClient.Wait()(context.self))
+                  })
+                subInfoQueue.offer(
+                  SubInfo(
+                    status = Option("init")
+                  )
                 )
-                client.tell(UDPClient.Stop())
-              })
-              strategyRun(
-                initSize = initSize,
-                standbys = standbys,
-                strategy = strategy,
-                loadKill = loadKill,
-                strategyKill = Option(source._1._2)
-              )
+                init(
+                  data.copy(
+                    kills = data.kills.copy(
+                      pressing = Option.empty
+                    )
+                  )
+                )
+              } else {
+                throw new Exception("状态错误")
+              }
             }
-            case e @ Strategy(element, pre) => {
+            case e @ ReleaseRun(run) => {
               logger.info(e.logJson)
-              loadTest(
-                initSize = initSize,
-                standbys = standbys,
-                strategy = e,
-                loadKill = loadKill
-              )
-            }
-            case e @ Stop() => {
-              logger.info(e.logJson)
-              loadKill.foreach(_.shutdown())
-              Source(standbys)
-                .runForeach(id => {
+              if (run) {
+                val source =
+                  Source(data.workings)
+                    .throttle(
+                      data.infos.releaseInfo.clients,
+                      data.infos.releaseInfo.time
+                    )
+                    .viaMat(KillSwitches.single)(Keep.right)
+                    .preMaterialize()
+
+                source._2.runForeach(id => {
                   val client = sharding.entityRefFor(
                     UDPClient.typeKey,
                     id
                   )
-                  client.tell(UDPClient.Stop())
+                  client.tell(UDPClient.Wait(Option("release"))(context.self))
                 })
-              standby(
-                initSize = initSize,
-                standbys = Set.empty,
-                strategy = strategy
+                subInfoQueue.offer(
+                  SubInfo(
+                    status = Option("release")
+                  )
+                )
+
+                timers.startTimerAtFixedRate(
+                  "online",
+                  OnlineCount(),
+                  data.online.seconds
+                )
+
+                release(
+                  data = data.copy(
+                    kills = data.kills.copy(
+                      release = Option(source._1)
+                    )
+                  )
+                )
+              } else {
+                throw new Exception("状态错误")
+              }
+            }
+            case e @ UDPClient.FireOk(clientId) => {
+              logger.info(e.logJson)
+              timers.startSingleTimer(
+                "fireOk",
+                SubPush(
+                  info = SubInfo(
+                    workings = Option(data.workings.size + 1)
+                  )
+                ),
+                1.seconds
+              )
+
+              pressing(
+                data.copy(
+                  workings = data.workings ++ Set(clientId)
+                )
               )
             }
+            case e @ ReleaseUpdate(clients, time) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(
+                SubInfo(
+                  releaseInfo = Option(
+                    ReleaseInfo(
+                      time = time,
+                      clients = clients
+                    )
+                  )
+                )
+              )
+              pressing(
+                data = data.copy(
+                  infos = data.infos.copy(
+                    releaseInfo = data.infos.releaseInfo.copy(
+                      time = time,
+                      clients = clients
+                    )
+                  )
+                )
+              )
+            }
+            case e @ SubPush(info) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(info)
+              Behaviors.same
+            }
+
           }
 
-        def standby(
-            initSize: Int,
-            standbys: Set[String],
-            strategy: Strategy
+        def init(
+            data: DataStore
         ): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ OnlineUpdate(online, onlineLimit) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(
+                SubInfo(
+                  online = online,
+                  onlineLimit = onlineLimit
+                )
+              )
+              init(
+                data.copy(
+                  online = online.getOrElse(data.online),
+                  onlineLimit = onlineLimit.getOrElse(data.onlineLimit)
+                )
+              )
+            }
+
+            case OnlineCount() => {
+              Behaviors.same
+            }
+            case e @ Sub() => {
+              logger.info(e.logJson)
+              val source = subInfoBrocastHub.runWith(StreamRefs.sourceRef())
+              e.replyTo.tell(SubOk(source))
+              Behaviors.same
+            }
+
+            case e @ UDPClient.WaitOk(clientId, key) => {
+              logger.info(e.logJson)
+              if (key.getOrElse("") == "release") {
+                subInfoQueue.offer(
+                  SubInfo(
+                    workings = Option(data.workings.size - 1)
+                  )
+                )
+              } else {
+                timers.startSingleTimer(
+                  "waitOk",
+                  SubPush(
+                    info = SubInfo(
+                      workings = Option(data.workings.size - 1)
+                    )
+                  ),
+                  1.seconds
+                )
+              }
+              init(
+                data.copy(
+                  workings = data.workings.filterNot(_ == clientId)
+                )
+              )
+            }
+            case e @ InitRun(run) => {
+              logger.info(e.logJson)
+              if (!run) {
+                timers.cancel("online")
+                Source(data.standbys)
+                  .runForeach(id => {
+                    val client = sharding.entityRefFor(
+                      UDPClient.typeKey,
+                      id
+                    )
+                    client.tell(UDPClient.Stop())
+                  })
+                subInfoQueue.offer(
+                  SubInfo(
+                    status = Option("stop")
+                  )
+                )
+                subInfoQueue.offer(
+                  SubInfo(
+                    standbys = Option(0)
+                  )
+                )
+                stop(
+                  data.copy(
+                    standbys = Set.empty,
+                    workings = Set.empty,
+                    statistics = Map.empty,
+                    kills = data.kills.copy(
+                      pressing = Option.empty,
+                      release = Option.empty
+                    )
+                  )
+                )
+              } else {
+                throw new Exception("状态错误")
+              }
+            }
+            case e @ Statistic(time, client, server) => {
+              logger.info(e.logJson)
+              init(
+                data.copy(
+                  statistics = data.statistics ++ Map(
+                    time ->
+                      StatisticInfo(
+                        client = client,
+                        server = server
+                      )
+                  )
+                )
+              )
+            }
             case e @ Query() => {
               logger.info(e.logJson)
               e.replyTo.tell(
                 QueryOk(
-                  initSize = initSize,
-                  standbySize = standbys.size,
-                  strategy = strategy,
-                  status = "standby"
+                  standbys = data.standbys.size,
+                  workings = data.workings.size,
+                  infos = data.infos,
+                  status = "init",
+                  online = data.online,
+                  onlineLimit = data.onlineLimit,
+                  statistics = data.statistics
+                    .map(ii => {
+                      Statistic(
+                        time = ii._1,
+                        client = ii._2.client,
+                        server = ii._2.server
+                      )
+                    })
+                    .toList
+                    .sortBy(_.time)
                 )
               )
               Behaviors.same
             }
-            case e @ LoadTest(
+            case e @ PressingRun(run) => {
+              logger.info(e.logJson)
+              if (run) {
+                val source = Source(data.standbys)
+                  .throttle(
+                    data.standbys.size,
+                    data.infos.pressingInfo.betweenTime
+                  )
+                  .viaMat(KillSwitches.single)(Keep.right)
+                  .preMaterialize()
+
+                source._2
+                  .runForeach(id => {
+                    val client = sharding.entityRefFor(
+                      UDPClient.typeKey,
+                      id
+                    )
+                    client.tell(
+                      UDPClient.AutoFire(
+                        hostName = data.infos.pressingInfo.host,
+                        port = data.infos.pressingInfo.port,
+                        elements = data.infos.pressingInfo.sendElements,
+                        pre = data.infos.pressingInfo.loadTime,
+                        datastream = data.infos.pressingInfo.dataLength
+                      )(context.self)
+                    )
+                  })
+                subInfoQueue.offer(
+                  SubInfo(
+                    status = Option("pressing")
+                  )
+                )
+                timers.startTimerAtFixedRate(
+                  "online",
+                  OnlineCount(),
+                  data.online.seconds
+                )
+                pressing(
+                  data.copy(
+                    kills = data.kills.copy(pressing = Option(source._1))
+                  )
+                )
+              } else {
+                throw new Exception("状态错误")
+              }
+            }
+            case e @ PressingUpdate(
                   hostName,
                   port,
-                  between,
-                  elements,
-                  pre,
-                  datastream
+                  betweenTime,
+                  sendElements,
+                  loadTime,
+                  dataLength
                 ) => {
               logger.info(e.logJson)
-              val source = Source(standbys)
-                .throttle(standbys.size, between)
-                .viaMat(KillSwitches.single)(Keep.both)
-                .preMaterialize()
-
-              source._2
-                .runForeach(id => {
-                  val client = sharding.entityRefFor(
-                    UDPClient.typeKey,
-                    id.toString
-                  )
-                  client.tell(
-                    UDPClient.AutoFire(
-                      hostName = hostName,
+              subInfoQueue.offer(
+                SubInfo(
+                  pressingInfo = Option(
+                    PressingInfo(
+                      host = hostName,
                       port = port,
-                      elements = elements,
-                      pre = pre,
-                      datastream = datastream
+                      loadTime = loadTime,
+                      dataLength = dataLength,
+                      betweenTime = betweenTime,
+                      sendElements = sendElements
                     )
                   )
-                })
-
-              loadTest(
-                initSize = initSize,
-                standbys = standbys,
-                strategy = strategy,
-                loadKill = Option(source._1._2)
+                )
               )
+
+              init(
+                data.copy(
+                  infos = data.infos.copy(
+                    pressingInfo = data.infos.pressingInfo.copy(
+                      host = hostName,
+                      port = port,
+                      loadTime = loadTime,
+                      dataLength = dataLength,
+                      betweenTime = betweenTime,
+                      sendElements = sendElements
+                    )
+                  )
+                )
+              )
+            }
+            case e @ SubPush(info) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(info)
+              Behaviors.same
             }
             case e @ UDPClient.InitOk(clientId) => {
               logger.info(e.logJson)
-              standby(
-                initSize = initSize,
-                standbys = standbys ++ Set(clientId),
-                strategy = strategy
-              )
-            }
-            case e @ CreateClient(size, time) => {
-              logger.info(e.logJson)
-              Source(1 to size)
-                .throttle(size, time)
-                .runForeach(id => {
-                  val client = sharding.entityRefFor(
-                    UDPClient.typeKey,
-                    id.toString
+              timers.startSingleTimer(
+                "initOk",
+                SubPush(
+                  info = SubInfo(
+                    standbys = Option(data.standbys.size + 1)
                   )
-                  client.tell(UDPClient.Init()(context.self))
-                })
-              standby(
-                initSize = size,
-                standbys = Set.empty,
-                strategy = strategy
+                ),
+                1.seconds
+              )
+              init(
+                data.copy(
+                  standbys = data.standbys ++ Set(clientId)
+                )
               )
             }
           }
-        standby(
-          initSize = 0,
-          standbys = Set.empty,
-          strategy = Strategy(
-            element = 1,
-            pre = 1.seconds
+
+        def stop(data: DataStore): Behavior[BaseSerializer] =
+          Behaviors.receiveMessage {
+            case e @ OnlineUpdate(online, onlineLimit) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(
+                SubInfo(
+                  online = online,
+                  onlineLimit = onlineLimit
+                )
+              )
+              stop(
+                data.copy(
+                  online = online.getOrElse(data.online),
+                  onlineLimit = onlineLimit.getOrElse(data.onlineLimit)
+                )
+              )
+            }
+
+            case e @ Sub() => {
+              logger.info(e.logJson)
+              val source = subInfoBrocastHub.runWith(StreamRefs.sourceRef())
+              e.replyTo.tell(SubOk(source))
+              Behaviors.same
+            }
+            case e @ SubPush(info) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(info)
+              Behaviors.same
+            }
+            case e @ Query() => {
+              logger.info(e.logJson)
+              e.replyTo.tell(
+                QueryOk(
+                  standbys = data.standbys.size,
+                  workings = data.workings.size,
+                  infos = data.infos,
+                  status = "stop",
+                  online = data.online,
+                  onlineLimit = data.onlineLimit,
+                  statistics = data.statistics
+                    .map(ii => {
+                      Statistic(
+                        time = ii._1,
+                        client = ii._2.client,
+                        server = ii._2.server
+                      )
+                    })
+                    .toList
+                    .sortBy(_.time)
+                )
+              )
+              Behaviors.same
+            }
+            case e @ InitRun(run) => {
+              logger.info(e.logJson)
+              if (run) {
+                Source(1 to data.infos.initInfo.clients)
+                  .throttle(
+                    data.infos.initInfo.clients,
+                    data.infos.initInfo.loadTime
+                  )
+                  .runForeach(id => {
+                    val client = sharding.entityRefFor(
+                      UDPClient.typeKey,
+                      id.toString
+                    )
+                    client.tell(UDPClient.Init()(context.self))
+                  })
+                subInfoQueue.offer(
+                  SubInfo(
+                    status = Option("init")
+                  )
+                )
+                init(data)
+              } else {
+                throw new Exception("状态错误")
+              }
+            }
+            case e @ InitUpdate(clients, time) => {
+              logger.info(e.logJson)
+              subInfoQueue.offer(
+                SubInfo(
+                  initInfo = Option(
+                    InitInfo(
+                      clients = clients,
+                      loadTime = time
+                    )
+                  )
+                )
+              )
+              stop(
+                data.copy(
+                  infos = data.infos.copy(
+                    initInfo = data.infos.initInfo.copy(
+                      clients = clients,
+                      loadTime = time
+                    )
+                  )
+                )
+              )
+            }
+          }
+
+        stop(
+          DataStore(
+            standbys = Set.empty,
+            workings = Set.empty,
+            statistics = Map.empty,
+            online = 3,
+            onlineLimit = 1000,
+            kills = KillInfos(
+              pressing = Option.empty,
+              release = Option.empty
+            ),
+            infos = Infos(
+              initInfo = InitInfo(
+                clients = 1,
+                loadTime = 1.seconds
+              ),
+              pressingInfo = PressingInfo(
+                host = "localhost",
+                port = 8080,
+                loadTime = 1.seconds,
+                dataLength = 0,
+                betweenTime = 1.seconds,
+                sendElements = 1
+              ),
+              releaseInfo = ReleaseInfo(
+                time = 1.seconds,
+                clients = 1
+              )
+            )
           )
         )
-      })
-    }
+      }
+    )
 
 }

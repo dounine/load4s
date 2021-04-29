@@ -17,7 +17,16 @@ import org.json4s.{
 
 import java.time.format.DateTimeFormatter
 import java.time.{LocalDate, LocalDateTime}
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{
+  DAYS,
+  FiniteDuration,
+  HOURS,
+  MICROSECONDS,
+  MILLISECONDS,
+  MINUTES,
+  NANOSECONDS,
+  SECONDS
+}
 
 object JsonSuport {
 
@@ -99,16 +108,31 @@ object JsonSuport {
             case JObject(
                   JField("unit", JString(unit)) :: JField(
                     "length",
-                    JLong(length)
+                    JInt(length)
                   ) :: Nil
+                ) =>
+              FiniteDuration(length.toLong, unit)
+            case JObject(
+                  JField(
+                    "length",
+                    JInt(length)
+                  ) :: JField("unit", JString(unit)) :: Nil
                 ) =>
               FiniteDuration(length.toLong, unit)
           },
           {
             case time: FiniteDuration =>
               JObject(
-                "unit" -> JString(time._2.name()),
-                "length" -> JLong(time._1.toLong)
+                "unit" -> JString(time.unit match {
+                  case DAYS         => "day"
+                  case HOURS        => "hour"
+                  case MINUTES      => "minute"
+                  case SECONDS      => "second"
+                  case MILLISECONDS => "millisecond"
+                  case MICROSECONDS => "microsecond"
+                  case NANOSECONDS  => "nanosecond"
+                }),
+                "length" -> JInt(time.length)
               )
           }
         )

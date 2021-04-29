@@ -94,49 +94,37 @@ class UDPClientManagerTest
       )
 
       manager.tell(
-        UDPClientManager.CreateClient(
-          size = 10,
-          time = 1.milliseconds
+        UDPClientManager.InitUpdate(
+          clients = 10,
+          loadTime = 1.milliseconds
         )
       )
 
       TimeUnit.SECONDS.sleep(1)
       val queryProbe = testKit.createTestProbe[BaseSerializer]()
       manager.tell(UDPClientManager.Query()(queryProbe.ref))
-      queryProbe
-        .receiveMessage()
-        .asInstanceOf[UDPClientManager.QueryOk] shouldBe UDPClientManager
-        .QueryOk(
-          initSize = 10,
-          standbySize = 10,
-          strategy = UDPClientManager.Strategy(
-            element = 1,
-            pre = 1.seconds
-          ),
-          status = "standby"
-        )
 
       val bindToLocal = new InetSocketAddress("127.0.0.1", 8080)
       val bindFlow: Flow[Datagram, Datagram, Future[InetSocketAddress]] =
         Udp.bindFlow(bindToLocal)
 
       manager.tell(
-        UDPClientManager.LoadTest(
-          hostName = "127.0.0.1",
+        UDPClientManager.PressingUpdate(
+          host = "127.0.0.1",
           port = bindToLocal.getPort,
-          between = 1.seconds,
-          elements = 2,
-          pre = 1.seconds,
-          datastream = 0
+          betweenTime = 1.seconds,
+          sendElements = 2,
+          loadTime = 1.seconds,
+          dataLength = 0
         )
       )
 
-      manager.tell(UDPClientManager.Strategy(
-        element = 1,
-        pre = 1.seconds
+      manager.tell(UDPClientManager.ReleaseUpdate(
+        clients = 1,
+        time = 1.seconds
       ))
 
-      manager.tell(UDPClientManager.StrategyRun())
+      manager.tell(UDPClientManager.ReleaseRun(true))
 
       val reslt = Source.maybe
         .via(bindFlow)
@@ -147,7 +135,6 @@ class UDPClientManagerTest
         .run()
 
       TimeUnit.SECONDS.sleep(5)
-
 
     }
 

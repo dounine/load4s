@@ -35,7 +35,10 @@ object UDPClient extends JsonParse {
       elements: Int,
       pre: FiniteDuration,
       datastream: Int = 0
-  ) extends BaseSerializer
+  )(val replyTo: ActorRef[BaseSerializer])
+      extends BaseSerializer
+
+  final case class FireOk(clientId: String) extends BaseSerializer
 
   final case class Init()(val replyTo: ActorRef[BaseSerializer])
       extends BaseSerializer
@@ -43,6 +46,13 @@ object UDPClient extends JsonParse {
   final case class InitOk(clientId: String) extends BaseSerializer
 
   final case class Stop() extends BaseSerializer
+
+  final case class Wait(key: Option[String] = Option.empty)(
+      val replyTo: ActorRef[BaseSerializer]
+  ) extends BaseSerializer
+
+  final case class WaitOk(clientId: String, key: Option[String])
+      extends BaseSerializer
 
   def apply(
       persistenceId: PersistenceId,
@@ -54,8 +64,13 @@ object UDPClient extends JsonParse {
           SystemMaterializer(context.system).materializer
         val clientId = persistenceId.id.split("\\|", -1).last
 
-        def standby(): Behavior[BaseSerializer] =
+        def idle(): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ Wait(key) => {
+              logger.info(e.logJson)
+              e.replyTo.tell(WaitOk(clientId, key))
+              Behaviors.same
+            }
             case e @ Stop() => {
               logger.info(e.logJson)
               Behaviors.stopped
@@ -72,21 +87,29 @@ object UDPClient extends JsonParse {
             case e @ AutoFire(_, _, _, _, _) => {
               logger.info(e.logJson)
               context.self.tell(e)
-              attack(Option.empty)
+              busy(Option.empty)
             }
           }
 
-        def attack(kill: Option[UniqueKillSwitch]): Behavior[BaseSerializer] =
+        def busy(kill: Option[UniqueKillSwitch]): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
             case e @ Init() => {
               logger.info(e.logJson)
               kill.foreach(_.shutdown())
-              standby()
+              idle()
             }
             case e @ Stop() => {
               logger.info(e.logJson)
               kill.foreach(_.shutdown())
               Behaviors.stopped
+            }
+            case e @ Wait(key) => {
+              logger.info(e.logJson)
+              kill.foreach(i => {
+                i.shutdown()
+                e.replyTo.tell(WaitOk(clientId, key))
+              })
+              idle()
             }
             case e @ AutoFire(hostName, port, elements, pre, datastream) => {
               logger.info(e.logJson)
@@ -101,10 +124,11 @@ object UDPClient extends JsonParse {
 
               result._2.runWith(Udp.sendSink()(context.system))
               val kill = result._1._2
-              attack(Option(kill))
+              e.replyTo.tell(FireOk(clientId))
+              busy(Option(kill))
             }
           }
-        standby()
+        idle()
       }
     }
 
