@@ -14,6 +14,7 @@ import com.dounine.load4s.tools.json.JsonParse
 import org.slf4j.LoggerFactory
 
 import java.net.InetSocketAddress
+import java.time.LocalDateTime
 import scala.concurrent.duration.FiniteDuration
 import scala.concurrent.duration._
 object UDPClient extends JsonParse {
@@ -118,7 +119,11 @@ object UDPClient extends JsonParse {
               val result = Source(1 to Int.MaxValue)
                 .viaMat(KillSwitches.single)(Keep.both)
                 .throttle(elements, pre)
-                .map(i => ByteString(s"${clientId}|${datastreamValue}|${i}"))
+                .map(i =>
+                  ByteString(
+                    s"${clientId}|${LocalDateTime.now()}|${datastreamValue}|${i}"
+                  )
+                )
                 .map(Datagram(_, destination))
                 .preMaterialize()
 

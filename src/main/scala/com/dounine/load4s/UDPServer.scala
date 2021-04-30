@@ -3,7 +3,7 @@ package com.dounine.load4s
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
 import akka.cluster.sharding.typed.scaladsl.ClusterSharding
-import akka.stream.SystemMaterializer
+import akka.stream.{OverflowStrategy, SystemMaterializer}
 import akka.stream.alpakka.udp.Datagram
 import akka.stream.alpakka.udp.scaladsl.Udp
 import akka.stream.scaladsl.{Flow, Sink, Source}
@@ -13,7 +13,7 @@ import redis.clients.jedis.{JedisPool, JedisPoolConfig, Protocol}
 
 import scala.concurrent.duration._
 import java.net.InetSocketAddress
-import java.time.{Instant, ZoneId}
+import java.time.{Instant, LocalDateTime, ZoneId, ZoneOffset}
 import scala.concurrent.Future
 
 object UDPServer extends JsonParse {
@@ -80,36 +80,51 @@ object UDPServer extends JsonParse {
         |-------  cpu while computer: ${cpu}  -------
         |-------  groupedWithin elements: ${withinElements}  -------
         |-------  groupedWithinTime: ${withinTime}  -------
+        |-------  CPU Core: ${Runtime
+      .getRuntime()
+      .availableProcessors}   -------
         |""".stripMargin)
 
     Source.maybe
       .via(bindFlow)
       .map(_.getData().utf8String)
-      .groupedWithin(
-        withinElements,
-        withinTime
-      )
-      .to(Sink.foreach(list => {
-        list.foreach(f = i => {
-          var index: Int = 0
-          while (index < cpu) {
-            index += 1
+      .mapAsync(Runtime.getRuntime().availableProcessors()) { item =>
+        {
+          Future {
+            item.split("\\|") match {
+              case Array(uid, dateTime, _*) => {
+                val time = LocalDateTime
+                  .parse(dateTime)
+                val timeMills =
+                  time
+                    .toInstant(ZoneOffset.of("+8"))
+                    .toEpochMilli() / 1000 / pre
+                val dt = Instant
+                  .ofEpochMilli(timeMills * 1000 * pre)
+                  .atZone(ZoneId.systemDefault())
+                  .toLocalDateTime
+                (dt, uid)
+              }
+            }
           }
-        })
-        if (debug) {
-          logger.info(list.toString())
         }
-        val time = System.currentTimeMillis() / 1000 / pre
-        val dateTime = Instant
-          .ofEpochMilli(time * 1000 * pre)
-          .atZone(ZoneId.systemDefault())
-          .toLocalDateTime
-        val uids = list.map(_.split("\\|").head)
-        val redis = jedisPool.getResource
-        redis.expire(dateTime.toString, expire)
-        redis.sadd(dateTime.toString, uids: _*)
-        redis.close()
-      }))
+      }
+      .async
+      .groupedWithin(withinElements, withinTime)
+      .mapAsync(Runtime.getRuntime().availableProcessors()) { tp2 =>
+        {
+          Future {
+            val redis = jedisPool.getResource
+            tp2
+              .groupBy(_._1)
+              .foreach(list => {
+                redis.expire(list._1.toString, expire)
+                redis.sadd(list._1.toString, list._2.map(_._2): _*)
+              })
+            redis.close()
+          }
+        }
+      }
       .run()
 
   }

@@ -13,6 +13,7 @@ import akka.stream.{
   OverflowStrategy,
   SourceRef,
   SystemMaterializer,
+  ThrottleMode,
   UniqueKillSwitch
 }
 import akka.stream.alpakka.udp.Datagram
@@ -83,10 +84,6 @@ object UDPClientManager extends JsonParse {
       releaseInfo: Option[ReleaseInfo] = None,
       status: Option[String] = None,
       statistic: Option[Statistic] = None
-  ) extends BaseSerializer
-
-  final case class SubPush(
-      info: SubInfo
   ) extends BaseSerializer
 
   final case class QueryOk(
@@ -175,6 +172,12 @@ object UDPClientManager extends JsonParse {
             2,
             OverflowStrategy.dropHead
           )
+          .throttle(
+            elements = 1,
+            per = 200.milliseconds,
+            maximumBurst = 1 * 10,
+            mode = ThrottleMode.Shaping
+          )
           .preMaterialize()(materializer)
         val subInfoBrocastHub =
           subInfoSource.runWith(BroadcastHub.sink)(materializer)
@@ -202,6 +205,9 @@ object UDPClientManager extends JsonParse {
             Protocol.DEFAULT_DATABASE
           )
         } else new JedisPool(c, redisHost, redisPort, 0)
+
+        val udpMaxChannels =
+          context.system.settings.config.getInt("akka.io.udp.max-channels")
 
         def currentTime(data: DataStore): LocalDateTime = {
           val time = System.currentTimeMillis() / 1000 / data.online
@@ -237,23 +243,11 @@ object UDPClientManager extends JsonParse {
             }
             case e @ UDPClient.WaitOk(clientId, key) => {
               logger.info(e.logJson)
-              if (key.getOrElse("") == "release") {
-                subInfoQueue.offer(
-                  SubInfo(
-                    workings = Option(data.workings.size - 1)
-                  )
+              subInfoQueue.offer(
+                SubInfo(
+                  workings = Option(data.workings.size - 1)
                 )
-              } else {
-                timers.startSingleTimer(
-                  "waitOk",
-                  SubPush(
-                    info = SubInfo(
-                      workings = Option(data.workings.size - 1)
-                    )
-                  ),
-                  1.seconds
-                )
-              }
+              )
               release(
                 data.copy(
                   workings = data.workings.filterNot(_ == clientId)
@@ -366,12 +360,6 @@ object UDPClientManager extends JsonParse {
                 throw new Exception("状态错误")
               }
             }
-            case e @ SubPush(info) => {
-              logger.info(e.logJson)
-              subInfoQueue.offer(info)
-              Behaviors.same
-            }
-
           }
 
         def pressing(
@@ -570,16 +558,11 @@ object UDPClientManager extends JsonParse {
             }
             case e @ UDPClient.FireOk(clientId) => {
               logger.info(e.logJson)
-              timers.startSingleTimer(
-                "fireOk",
-                SubPush(
-                  info = SubInfo(
-                    workings = Option(data.workings.size + 1)
-                  )
-                ),
-                1.seconds
+              subInfoQueue.offer(
+                SubInfo(
+                  workings = Option(data.workings.size + 1)
+                )
               )
-
               pressing(
                 data.copy(
                   workings = data.workings ++ Set(clientId)
@@ -609,12 +592,6 @@ object UDPClientManager extends JsonParse {
                 )
               )
             }
-            case e @ SubPush(info) => {
-              logger.info(e.logJson)
-              subInfoQueue.offer(info)
-              Behaviors.same
-            }
-
           }
 
         def init(
@@ -654,23 +631,11 @@ object UDPClientManager extends JsonParse {
 
             case e @ UDPClient.WaitOk(clientId, key) => {
               logger.info(e.logJson)
-              if (key.getOrElse("") == "release") {
-                subInfoQueue.offer(
-                  SubInfo(
-                    workings = Option(data.workings.size - 1)
-                  )
+              subInfoQueue.offer(
+                SubInfo(
+                  workings = Option(data.workings.size - 1)
                 )
-              } else {
-                timers.startSingleTimer(
-                  "waitOk",
-                  SubPush(
-                    info = SubInfo(
-                      workings = Option(data.workings.size - 1)
-                    )
-                  ),
-                  1.seconds
-                )
-              }
+              )
               init(
                 data.copy(
                   workings = data.workings.filterNot(_ == clientId)
@@ -838,21 +803,12 @@ object UDPClientManager extends JsonParse {
                 )
               )
             }
-            case e @ SubPush(info) => {
-              logger.info(e.logJson)
-              subInfoQueue.offer(info)
-              Behaviors.same
-            }
             case e @ UDPClient.InitOk(clientId) => {
               logger.info(e.logJson)
-              timers.startSingleTimer(
-                "initOk",
-                SubPush(
-                  info = SubInfo(
-                    standbys = Option(data.standbys.size + 1)
-                  )
-                ),
-                1.seconds
+              subInfoQueue.offer(
+                SubInfo(
+                  standbys = Option(data.standbys.size + 1)
+                )
               )
               init(
                 data.copy(
@@ -884,11 +840,6 @@ object UDPClientManager extends JsonParse {
               logger.info(e.logJson)
               val source = subInfoBrocastHub.runWith(StreamRefs.sourceRef())
               e.replyTo.tell(SubOk(source))
-              Behaviors.same
-            }
-            case e @ SubPush(info) => {
-              logger.info(e.logJson)
-              subInfoQueue.offer(info)
               Behaviors.same
             }
             case e @ Query() => {
@@ -946,7 +897,7 @@ object UDPClientManager extends JsonParse {
                 SubInfo(
                   initInfo = Option(
                     InitInfo(
-                      clients = clients,
+                      clients = Math.min(clients, udpMaxChannels),
                       loadTime = time
                     )
                   )
@@ -956,7 +907,7 @@ object UDPClientManager extends JsonParse {
                 data.copy(
                   infos = data.infos.copy(
                     initInfo = data.infos.initInfo.copy(
-                      clients = clients,
+                      clients = Math.min(clients, udpMaxChannels),
                       loadTime = time
                     )
                   )
