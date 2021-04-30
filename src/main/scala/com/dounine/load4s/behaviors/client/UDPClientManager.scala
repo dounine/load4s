@@ -937,7 +937,7 @@ object UDPClientManager extends JsonParse {
                 port = 8080,
                 loadTime = 1.seconds,
                 dataLength = 0,
-                betweenTime = 1.seconds,
+                betweenTime = 3.seconds,
                 sendElements = 1
               ),
               releaseInfo = ReleaseInfo(
