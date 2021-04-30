@@ -124,12 +124,15 @@ object UDPServer extends JsonParse {
                   .ofEpochMilli(timeMills * pre)
                   .atZone(ZoneId.systemDefault())
                   .toLocalDateTime
-                (dt, uid)
+                Option((dt, uid))
               }
+              case _ => Option.empty
             }
           }
         }
       }
+      .filter(_.isDefined)
+      .map(_.get)
       .async
       .groupedWithin(withinElements, withinTime)
       .mapAsync(Runtime.getRuntime().availableProcessors()) { tp2 =>
