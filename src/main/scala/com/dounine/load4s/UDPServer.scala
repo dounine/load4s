@@ -90,15 +90,14 @@ object UDPServer extends JsonParse {
     Source.maybe
       .via(bindFlow)
       .map(_.getData().utf8String)
-      .mapAsync(Runtime.getRuntime().availableProcessors()) { item =>
+      .mapAsync(Runtime.getRuntime().availableProcessors() * 2) { item =>
         {
           Future {
             item.split("\\|") match {
               case Array(uid, dateTime, preStr, _*) => {
                 var index = 0
-                while (index < cpu) {
-                  index += 1
-                }
+                val sysTime = System.currentTimeMillis()
+                while ((System.currentTimeMillis() - sysTime) < cpu) {}
                 val time =
                   if (clientTime)
                     LocalDateTime
