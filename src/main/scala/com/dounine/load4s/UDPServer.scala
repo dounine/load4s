@@ -61,12 +61,13 @@ object UDPServer extends JsonParse {
       )
     } else new JedisPool(c, redisHost, redisPort, 0)
 
-    val pre = config.getInt("client.duration")
     val expire = config.getInt("client.expire")
     val cpu = config.getInt("client.cpu")
 
     val withinElements = config.getInt("client.elements")
     val withinTime = config.getDuration("client.time").toMillis.milliseconds
+    val clientTime = config.getBoolean("client.clientTime")
+    val overTime = config.getDuration("client.overTime").toMillis.milliseconds
     val debug = config.getBoolean("client.debug")
 
     logger.info(s"""
@@ -75,8 +76,9 @@ object UDPServer extends JsonParse {
         |-------  redis host: ${redisHost}  -------
         |-------  redis port: ${redisPort}   -------
         |-------  redis password: ${redisPassword}   -------
-        |-------  pre time save to redis: ${pre}s   -------
         |-------  redis key expire time: ${expire}s   -------
+        |-------  use client time: ${clientTime}   -------
+        |-------  client over time: ${overTime}   -------
         |-------  cpu while computer: ${cpu}  -------
         |-------  groupedWithin elements: ${withinElements}  -------
         |-------  groupedWithinTime: ${withinTime}  -------
@@ -92,15 +94,34 @@ object UDPServer extends JsonParse {
         {
           Future {
             item.split("\\|") match {
-              case Array(uid, dateTime, _*) => {
-                val time = LocalDateTime
-                  .parse(dateTime)
+              case Array(uid, dateTime, preStr, _*) => {
+                var index = 0
+                while (index < cpu) {
+                  index += 1
+                }
+                val time =
+                  if (clientTime)
+                    LocalDateTime
+                      .parse(dateTime)
+                  else LocalDateTime.now()
+                if (clientTime) {
+                  val timeout = java.time.Duration
+                    .between(
+                      time,
+                      LocalDateTime.now()
+                    )
+
+                  if (timeout.toMillis > overTime.toMillis) {
+                    logger.info(s"element receive over time -> ${timeout}")
+                  }
+                }
+                val pre = Duration(preStr).toMillis
                 val timeMills =
                   time
                     .toInstant(ZoneOffset.of("+8"))
-                    .toEpochMilli() / 1000 / pre
+                    .toEpochMilli() / pre
                 val dt = Instant
-                  .ofEpochMilli(timeMills * 1000 * pre)
+                  .ofEpochMilli(timeMills * pre)
                   .atZone(ZoneId.systemDefault())
                   .toLocalDateTime
                 (dt, uid)
@@ -118,11 +139,22 @@ object UDPServer extends JsonParse {
             tp2
               .groupBy(_._1)
               .foreach(list => {
+                if (debug) {
+                  logger.info(
+                    s"${list._1} set values -> ${list._2.map(_._2).mkString(",")}"
+                  )
+                }
                 redis.expire(list._1.toString, expire)
                 redis.sadd(list._1.toString, list._2.map(_._2): _*)
               })
             redis.close()
           }
+        }
+      }
+      .recover {
+        case e: Throwable => {
+          logger.error(e.getMessage)
+          e.printStackTrace()
         }
       }
       .run()

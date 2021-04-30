@@ -121,7 +121,8 @@ object UDPClient extends JsonParse {
                 .throttle(elements, pre)
                 .map(i =>
                   ByteString(
-                    s"${clientId}|${LocalDateTime.now()}|${datastreamValue}|${i}"
+                    s"${clientId}|${LocalDateTime
+                      .now()}|${pre}|${datastreamValue}|${i}"
                   )
                 )
                 .map(Datagram(_, destination))
