@@ -1,5 +1,6 @@
 package com.dounine.load4s.behaviors.client
 
+import akka.Done
 import akka.actor.typed.{ActorRef, Behavior}
 import akka.actor.typed.scaladsl.Behaviors
 import akka.cluster.sharding.typed.scaladsl.{
@@ -157,6 +158,8 @@ object UDPClientManager extends JsonParse {
       infos: Infos
   ) extends BaseSerializer
 
+  final case class Stop()(val replyTo: ActorRef[Done]) extends BaseSerializer
+
   def apply(
       persistenceId: PersistenceId,
       shard: ActorRef[ClusterSharding.ShardCommand]
@@ -221,6 +224,12 @@ object UDPClientManager extends JsonParse {
             data: DataStore
         ): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ Stop() => {
+              logger.info(e.logJson)
+              //shut down the actor internals
+              e.replyTo.tell(Done)
+              Behaviors.stopped
+            }
             case e @ OnlineUpdate(online, onlineLimit) => {
               logger.info(e.logJson)
               subInfoQueue.offer(
@@ -366,6 +375,12 @@ object UDPClientManager extends JsonParse {
             data: DataStore
         ): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ Stop() => {
+              logger.info(e.logJson)
+              //shut down the actor internals
+              e.replyTo.tell(Done)
+              Behaviors.stopped
+            }
             case e @ OnlineUpdate(online, onlineLimit) => {
               logger.info(e.logJson)
               subInfoQueue.offer(
@@ -598,6 +613,12 @@ object UDPClientManager extends JsonParse {
             data: DataStore
         ): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ Stop() => {
+              logger.info(e.logJson)
+              //shut down the actor internals
+              e.replyTo.tell(Done)
+              Behaviors.stopped
+            }
             case e @ OnlineUpdate(online, onlineLimit) => {
               logger.info(e.logJson)
               subInfoQueue.offer(
@@ -820,6 +841,12 @@ object UDPClientManager extends JsonParse {
 
         def stop(data: DataStore): Behavior[BaseSerializer] =
           Behaviors.receiveMessage {
+            case e @ Stop() => {
+              logger.info(e.logJson)
+              //shut down the actor internals
+              e.replyTo.tell(Done)
+              Behaviors.stopped
+            }
             case e @ OnlineUpdate(online, onlineLimit) => {
               logger.info(e.logJson)
               subInfoQueue.offer(

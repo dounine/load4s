@@ -1,5 +1,7 @@
 package com.dounine.load4s
 
+import akka.Done
+import akka.actor.CoordinatedShutdown
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
 import akka.cluster.Cluster
@@ -13,10 +15,16 @@ import akka.management.scaladsl.AkkaManagement
 import akka.persistence.typed.PersistenceId
 import akka.stream.SystemMaterializer
 import com.dounine.load4s.behaviors.client.{UDPClient, UDPClientManager}
-import com.dounine.load4s.router.routers.{BindRouters, CachingRouter, HealthRouter}
+import com.dounine.load4s.router.routers.{
+  BindRouters,
+  CachingRouter,
+  HealthRouter
+}
 import com.typesafe.config.ConfigFactory
 import org.slf4j.LoggerFactory
 
+import java.util.concurrent.TimeUnit
+import scala.concurrent.Future
 import scala.util.{Failure, Success}
 
 object Load4s {
@@ -67,6 +75,20 @@ object Load4s {
 
     val cluster: Cluster = Cluster.get(system)
     val managementRoutes: Route = ClusterHttpManagementRoutes(cluster)
+
+    CoordinatedShutdown(system)
+      .addTask(CoordinatedShutdown.PhaseBeforeServiceUnbind, "task") { () =>
+        {
+          import scala.concurrent.duration._
+          sharding
+            .entityRefFor(
+              UDPClientManager.typeKey,
+              UDPClientManager.typeKey.name
+            )
+            .ask(UDPClientManager.Stop())(3.seconds)
+        }
+      }
+
     Http(system)
       .newServerAt(
         interface = config.getString("server.host"),
